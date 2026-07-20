@@ -5,10 +5,13 @@
 
 .DESCRIPTION
     This is a READ-ONLY detection script. It does not delete, quarantine, or
-    modify anything — it only reports what it finds so you can review and
+    modify anything â€” it only reports what it finds so you can review and
     decide what to do next.
 
     Checks performed:
+      0. Pulls a LIVE list of known Roblox executors from the WEAO API
+         (https://docs.weao.xyz), including whether each is currently
+         detected by Roblox's anti-cheat (Hyperion), free/paid, etc.
       1. Running processes matched against known cheat-tool names
       2. Known install/cache folders for popular exploit executors
       3. Suspicious files in Downloads / Desktop / Temp matching known
@@ -18,13 +21,17 @@
          injection-prone locations
       6. Browser download history folders (filenames only, not content)
 
+    If the WEAO API is unreachable (offline/rate-limited), the script
+    falls back to a static list of well-known executor names so it still
+    works without internet access.
+
 .OUTPUTS
     A table printed to screen, plus a CSV report saved next to the script:
     RobloxCheatScan_<timestamp>.csv
 
 .NOTES
     Run in an elevated PowerShell window (Run as Administrator) for the
-    most complete results — some folders/registry keys need admin rights
+    most complete results â€” some folders/registry keys need admin rights
     to read fully.
 #>
 
@@ -48,17 +55,62 @@ function Add-Suspect {
 }
 
 # --- Known names associated with Roblox cheat/exploit tools ---
-# (executors, injectors, script hubs commonly flagged by Roblox anti-cheat)
+# Static fallback list (executors, injectors, script hubs commonly flagged
+# by Roblox anti-cheat), used if the live WEAO lookup below fails.
 $knownNames = @(
     'synapse', 'synapsex', 'krnl', 'fluxus', 'electron', 'wave',
     'jjsploit', 'codex', 'comet', 'hydrogen', 'sirhurt', 'sentinel',
     'evon', 'arceusx', 'scriptware', 'protosmasher', 'oxygenu',
     'valyse', 'trigon', 'cryptic', 'awp', 'delta-executor', 'vega-x',
     'solara', 'seliware', 'zorara', 'nihon', 'celery', 'temple',
-    'exoline', 'calamari'
+    'exoline', 'calamari', 'potassium', 'matcha', 'xeno', 'bunni',
+    'photon'
 )
 
-$namePattern = ($knownNames -join '|')
+# --- Live executor list from WEAO (What Exploits Are Online) ---
+# WEAO tracks the current status of most public Roblox executors/exploits.
+# We pull their live list to catch tools not in the static list above,
+# and to record extra intel (detected-by-anticheat, free/paid, platform).
+Write-Host "[0/6] Fetching live executor list from WEAO..." -ForegroundColor Yellow
+$weaoExploits = $null
+try {
+    $headers = @{ 'User-Agent' = 'WEAO-3PService' }
+    $weaoExploits = Invoke-RestMethod -Uri 'https://weao.xyz/api/status/exploits' -Headers $headers -TimeoutSec 10
+} catch {
+    Write-Host "  Could not reach WEAO API (offline or rate-limited) - falling back to static list only." -ForegroundColor DarkYellow
+}
+
+$weaoNames = @()
+if ($weaoExploits) {
+    $weaoNames = $weaoExploits | ForEach-Object { $_.title } | Where-Object { $_ } | ForEach-Object {
+        [regex]::Escape($_.ToLower()).Replace('\ ', '.?')
+    }
+    Write-Host "  Loaded $($weaoNames.Count) executor names from WEAO." -ForegroundColor Green
+}
+
+$allNames = ($knownNames + $weaoNames) | Sort-Object -Unique
+$namePattern = ($allNames -join '|')
+
+# Lookup table so we can attach WEAO intel (detected/free/platform) to matches
+$weaoLookup = @{}
+if ($weaoExploits) {
+    foreach ($e in $weaoExploits) {
+        if ($e.title) { $weaoLookup[$e.title.ToLower()] = $e }
+    }
+}
+
+function Get-WeaoIntel {
+    param($MatchedText)
+    foreach ($key in $weaoLookup.Keys) {
+        if ($MatchedText -match [regex]::Escape($key).Replace('\ ','.?')) {
+            $e = $weaoLookup[$key]
+            $detectedStr = if ($e.detected) { "DETECTED by anti-cheat" } else { "currently UNDETECTED" }
+            $freeStr = if ($e.free) { "free" } else { "paid" }
+            return "WEAO: '$($e.title)' v$($e.version), $freeStr, $detectedStr, platform: $($e.platform)"
+        }
+    }
+    return $null
+}
 
 Write-Host "=== Roblox Cheat Scanner ===" -ForegroundColor Cyan
 Write-Host "This is read-only: nothing will be modified or deleted.`n"
@@ -66,7 +118,10 @@ Write-Host "This is read-only: nothing will be modified or deleted.`n"
 # 1. Running processes
 Write-Host "[1/6] Checking running processes..." -ForegroundColor Yellow
 Get-Process | Where-Object { $_.ProcessName -match $namePattern } | ForEach-Object {
-    Add-Suspect "Process" $_.ProcessName $_.Path "Matches known cheat-tool name (running now)"
+    $intel = Get-WeaoIntel $_.ProcessName
+    $detail = "Matches known cheat-tool name (running now)"
+    if ($intel) { $detail = "$detail | $intel" }
+    Add-Suspect "Process" $_.ProcessName $_.Path $detail
 }
 
 # 2. Known install/cache folders
@@ -93,7 +148,12 @@ foreach ($root in $fileRoots) {
     if (Test-Path $root) {
         Get-ChildItem -Path $root -File -Recurse -ErrorAction SilentlyContinue -Depth 2 |
             Where-Object { $_.Name -match $namePattern -and $_.Extension -match '\.(exe|dll|zip|rar|7z)$' } |
-            ForEach-Object { Add-Suspect "File" $_.Name $_.FullName "Filename matches known cheat tool ($($_.Extension))" }
+            ForEach-Object {
+                $intel = Get-WeaoIntel $_.Name
+                $detail = "Filename matches known cheat tool ($($_.Extension))"
+                if ($intel) { $detail = "$detail | $intel" }
+                Add-Suspect "File" $_.Name $_.FullName $detail
+            }
     }
 }
 
@@ -153,7 +213,7 @@ foreach ($db in $browserDownloadDbs) {
                 Add-Suspect "Browser History" (Split-Path $db -Leaf) $db "Possible reference to known cheat tool found in browser history file"
             }
         } catch {
-            # File locked (browser running) — skip silently
+            # File locked (browser running) â€” skip silently
         }
     }
 }
